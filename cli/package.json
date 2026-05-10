@@ -1,0 +1,17 @@
+{
+  "name": "anontun",
+  "version": "0.0.0",
+  "description": "Anonymous tunnel CLI — exposes localhost via a self-hosted CF relay.",
+  "type": "module",
+  "bin": {
+    "anontun": "./src/cli.mjs"
+  },
+  "main": "./src/connector.mjs",
+  "files": ["src", "README.md"],
+  "scripts": {
+    "start": "node src/cli.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}

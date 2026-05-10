@@ -20,6 +20,7 @@ export async function startConnector({ relayBase, originUrl }) {
   ws.on("message", (raw) => {
     let msg
     try { msg = JSON.parse(raw.toString()) } catch { return }
+    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] recv: ${msg.type} id=${msg.id ?? ""} ${msg.upgrade ? "(upgrade)" : ""}`)
     switch (msg.type) {
       case "registered":
         console.log(`\n  ${msg.url}\n`)
@@ -114,13 +115,18 @@ export async function startConnector({ relayBase, originUrl }) {
     })
     upstream.binaryType = "arraybuffer"
 
+    // Capture the 101's response headers when they arrive...
+    let respHeaders = {}
     upstream.on("upgrade", (res) => {
-      // 101 received from origin. Forward back to relay so it can accept the
-      // public-side WS.
-      const respHeaders = {}
       for (const [k, v] of Object.entries(res.headers)) {
         respHeaders[k] = Array.isArray(v) ? v.join(", ") : String(v ?? "")
       }
+    })
+    // ...but DEFER sending res_open (and thus the public client's 101)
+    // until the upstream is fully OPEN. Otherwise the public client sees
+    // 101 and starts sending frames immediately, and forwardWsFrame()
+    // drops them because upstream.readyState is still CONNECTING.
+    upstream.on("open", () => {
       sendFrame({
         type: "res_open",
         id: msg.id,
@@ -161,6 +167,7 @@ export async function startConnector({ relayBase, originUrl }) {
 
   function forwardWsFrame(msg) {
     const upstream = upstreamWss.get(msg.id)
+    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] forwardWsFrame id=${msg.id} upstream=${upstream ? "yes" : "no"} readyState=${upstream?.readyState}`)
     if (!upstream || upstream.readyState !== WebSocket.OPEN) return
     const data = Buffer.from(msg.data_b64, "base64")
     if (msg.binary) upstream.send(data, { binary: true })

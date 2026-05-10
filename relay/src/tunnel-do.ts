@@ -30,12 +30,17 @@ export class TunnelDO extends Server<Env> {
   //   /_connect            → the connector (origin-side, holds the tunnel)
   //   /t/<token>/<rest>    → a public client opening a WS through the tunnel
 
-  onConnect(c: Connection, ctx: { request: Request }): void {
+  async onConnect(c: Connection, ctx: { request: Request }): Promise<void> {
     const url = new URL(ctx.request.url)
     if (url.pathname === "/_connect") {
       this.handleConnectorOpen(c, ctx.request)
     } else if (url.pathname.startsWith("/t/")) {
-      void this.handlePublicWsOpen(c, ctx.request)
+      // MUST await: PartyServer holds the 101 response until onConnect resolves.
+      // If we fire-and-forget here, the public client gets 101 immediately and
+      // its first frame (e.g. a `register` from a wrapped agent-socket WS)
+      // arrives before our addEventListener("message", ...) is attached, and
+      // is silently consumed by PartyServer's onMessage filter.
+      await this.handlePublicWsOpen(c, ctx.request)
     } else {
       c.close(4404, "unknown ws path")
     }

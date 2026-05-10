@@ -61,6 +61,13 @@ export async function startConnector({ relayBase, originUrl }) {
     // Don't forward our own host header — set the local origin's host.
     delete headers.host
     delete headers["content-length"]  // node will recompute
+    // Force the local origin to return UNcompressed bytes. CF Workers'
+    // Response constructor strips content-encoding from raw byte responses,
+    // so if upstream sends gzip, the relay would forward compressed bytes
+    // without the encoding header — clients then can't decode. Asking for
+    // identity makes the body plain; CF re-encodes on the way out and sets
+    // Content-Encoding correctly.
+    headers["accept-encoding"] = "identity"
 
     const body = msg.body_b64 ? Buffer.from(msg.body_b64, "base64") : Buffer.alloc(0)
 

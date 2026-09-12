@@ -5,13 +5,25 @@ import { WebSocket } from "ws"
 import http from "node:http"
 import https from "node:https"
 import { URL } from "node:url"
+import { ConnectProxyAgent, proxyUrlFor } from "./proxy-agent.mjs"
 
-export async function startConnector({ relayBase, originUrl }) {
+// keepPath: forward the public path with its /t/<token> prefix intact instead
+// of stripped. Needed for apps that must be served under that prefix — e.g. a
+// Vite dev server started with base=/t/<token>/ — otherwise the origin sees
+// "/" and redirects to its base, which loops back through the relay.
+export async function startConnector({ relayBase, originUrl, keepPath = false }) {
   const wsBase = relayBase.replace(/^http/, "ws").replace(/\/+$/, "")
   const wsUrl = `${wsBase}/_connect`
 
-  const ws = new WebSocket(wsUrl)
+  const wsOpts = {}
+  const proxyUrl = wsUrl.startsWith("wss:") ? proxyUrlFor(relayBase) : null
+  if (proxyUrl) {
+    wsOpts.agent = new ConnectProxyAgent(proxyUrl)
+    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] relay via proxy ${new URL(proxyUrl).host}`)
+  }
+  const ws = new WebSocket(wsUrl, wsOpts)
   const upstreamWss = new Map()  // id → upstream WS connections to local origin
+  let pathPrefix = ""            // "/t/<token>" when keepPath, set on register
 
   ws.on("open", () => {
     // Server sends 'registered' with our token + URL right after opening.
@@ -23,6 +35,7 @@ export async function startConnector({ relayBase, originUrl }) {
     if (process.env.ANONTUN_DEBUG) console.error(`[anontun] recv: ${msg.type} id=${msg.id ?? ""} ${msg.upgrade ? "(upgrade)" : ""}`)
     switch (msg.type) {
       case "registered":
+        if (keepPath) pathPrefix = `/t/${msg.token}`
         console.log(`\n  ${msg.url}\n`)
         console.log(`  → ${originUrl}\n`)
         console.log(`  (Ctrl-C to stop)\n`)
@@ -55,7 +68,7 @@ export async function startConnector({ relayBase, originUrl }) {
   // ── HTTP request handler ─────────────────────────────────────
 
   function handleHttp(msg) {
-    const target = new URL(msg.path, originUrl)
+    const target = new URL(pathPrefix + msg.path, originUrl)
     const lib = target.protocol === "https:" ? https : http
     const headers = { ...msg.headers }
     // Don't forward our own host header — set the local origin's host.
@@ -114,10 +127,16 @@ export async function startConnector({ relayBase, originUrl }) {
 
   function handleUpgrade(msg) {
     const wsScheme = originUrl.startsWith("https:") ? "wss:" : "ws:"
-    const target = new URL(msg.path, originUrl)
+    const target = new URL(pathPrefix + msg.path, originUrl)
     const targetUrl = `${wsScheme}//${target.host}${target.pathname}${target.search}`
 
-    const upstream = new WebSocket(targetUrl, {
+    // Forward the requested subprotocols (e.g. Vite's HMR client sends
+    // `vite-hmr`; the dev server ignores upgrades without it). The `ws`
+    // client emits the header itself, so it is stripped from the passthrough
+    // set and re-supplied here as the protocols argument.
+    const protocols = (msg.headers?.["sec-websocket-protocol"] ?? "")
+      .split(",").map((p) => p.trim()).filter(Boolean)
+    const upstream = new WebSocket(targetUrl, protocols, {
       headers: stripHopByHop(msg.headers),
     })
     upstream.binaryType = "arraybuffer"

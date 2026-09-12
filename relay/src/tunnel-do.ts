@@ -30,6 +30,21 @@ export class TunnelDO extends Server<Env> {
   //   /_connect            → the connector (origin-side, holds the tunnel)
   //   /t/<token>/<rest>    → a public client opening a WS through the tunnel
 
+  // Public-side WebSocket upgrades bypass PartyServer's onConnect and are
+  // answered by handleWsUpgrade with our own WebSocketPair. PartyServer
+  // sends the 101 itself, before onConnect runs, so there is no way to echo
+  // the client's requested subprotocol (Sec-WebSocket-Protocol) on that
+  // path — and browsers drop a WebSocket whose 101 does not echo it (Vite's
+  // HMR client is the common case). Only the connector's /_connect upgrade
+  // still goes through PartyServer.
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url)
+    if (url.pathname.startsWith("/t/") && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      return this.onRequest(req)
+    }
+    return super.fetch(req)
+  }
+
   async onConnect(c: Connection, ctx: { request: Request }): Promise<void> {
     const url = new URL(ctx.request.url)
     if (url.pathname === "/_connect") {
@@ -318,13 +333,21 @@ export class TunnelDO extends Server<Env> {
     server.addEventListener("close", (ev) => {
       this.activeWs.delete(id)
       this.send({ type: "ws_close", id, code: ev.code, reason: ev.reason })
+      // Complete the closing handshake towards the public client; the runtime
+      // does not echo the close frame by itself, and `ws` clients otherwise
+      // wait ~30 s before giving up.
+      try { server.close(ev.code, ev.reason) } catch {}
     })
     server.addEventListener("error", () => {
       this.activeWs.delete(id)
       this.send({ type: "ws_close", id })
     })
 
-    return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket })
+    // Echo the subprotocol the local origin negotiated, if any.
+    const respHeaders = new Headers()
+    const proto = result.headers?.["sec-websocket-protocol"]
+    if (proto) respHeaders.set("sec-websocket-protocol", proto)
+    return new Response(null, { status: 101, headers: respHeaders, webSocket: client } as ResponseInit & { webSocket: WebSocket })
   }
 
   private send(frame: Frame): boolean {

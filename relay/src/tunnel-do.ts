@@ -307,6 +307,7 @@ export class TunnelDO extends Server<Env> {
       case "ws_close": this.handleWsClose(msg); return
       case "ping":     this.send({ type: "pong", id: msg.id }); return
       case "pong":     return
+      case "bye":      this.teardownConnector(); return
       default:         return
     }
   }

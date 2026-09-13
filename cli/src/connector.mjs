@@ -20,6 +20,19 @@ import { ConnectProxyAgent, proxyUrlFor } from "./proxy-agent.mjs"
 const SSE_RECONNECT_ATTEMPTS = 10
 const SSE_RECONNECT_DELAY_MS = 1000
 
+// Clean shutdown: tell the relay we are leaving so the public URL turns into
+// a 503 right away instead of after a stream timeout + reconnect grace.
+let onShutdown = null
+let shuttingDown = false
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    if (shuttingDown) process.exit(0)
+    shuttingDown = true
+    try { await Promise.race([onShutdown?.(), sleep(2000)]) } catch {}
+    process.exit(0)
+  })
+}
+
 // keepPath: forward the public path with its /t/<token> prefix intact instead
 // of stripped. Needed for apps that must be served under that prefix — e.g. a
 // Vite dev server started with base=/t/<token>/ — otherwise the origin sees
@@ -56,6 +69,7 @@ function runWsTransport({ relayBase, originUrl, keepPath }) {
     }
     const ws = new WebSocket(wsUrl, wsOpts)
     let registered = false
+    onShutdown = () => new Promise((r) => { ws.once("close", r); try { ws.close(1000, "bye") } catch { r() } })
 
     const origin = createOriginBridge(originUrl, keepPath, (frame) => {
       if (ws.readyState !== WebSocket.OPEN) return
@@ -78,6 +92,7 @@ function runWsTransport({ relayBase, originUrl, keepPath }) {
     })
 
     ws.on("close", (code, reason) => {
+      if (shuttingDown) return
       if (!registered) {
         reject(new Error(`ws closed before register code=${code} reason=${reason?.toString() ?? ""}`))
         return
@@ -86,6 +101,7 @@ function runWsTransport({ relayBase, originUrl, keepPath }) {
       process.exit(1)
     })
     ws.on("error", (err) => {
+      if (shuttingDown) return
       if (!registered) {
         reject(new Error(`ws error: ${err.message}`))
         return
@@ -129,6 +145,7 @@ async function runSseTransport({ relayBase, originUrl, keepPath }) {
   }
 
   const origin = createOriginBridge(originUrl, keepPath, send)
+  onShutdown = () => (token && secret) ? post({ type: "bye" }) : Promise.resolve()
 
   for (let attempt = 0; ; attempt++) {
     const url = token

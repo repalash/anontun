@@ -66,6 +66,10 @@ export interface WsCloseFrame {
   reason?: string
 }
 
+// Connector → relay: clean shutdown (Ctrl-C). The relay tears the tunnel down
+// at once instead of waiting for the stream to time out.
+export interface ByeFrame { type: "bye" }
+
 // Heartbeat
 export interface PingFrame { type: "ping"; id: string }
 export interface PongFrame { type: "pong"; id: string }
@@ -75,3 +79,4 @@ export type Frame =
   | ReqOpenFrame | ResOpenFrame
   | WsFrameFrame | WsCloseFrame
   | PingFrame | PongFrame
+  | ByeFrame

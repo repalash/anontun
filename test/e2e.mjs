@@ -96,7 +96,11 @@ let relay = process.env.RELAY?.replace(/\/+$/, "")
 let wrangler = null
 if (!relay) {
   const port = await freePort()
-  wrangler = spawn("npx", ["wrangler", "dev", "--port", String(port), "--local", "--log-level", "info", "--var", `TUNNEL_HOST:${TUNNEL_HOST}`],
+  // WRANGLER_DEV_ARGS: extra flags, e.g. "--env test" where the deploy config
+  // carries routes (wrangler dev rewrites every request's host to the route's
+  // hostname, which hides the Host header the host-based cases need).
+  const extra = (process.env.WRANGLER_DEV_ARGS ?? "").split(" ").filter(Boolean)
+  wrangler = spawn("npx", ["wrangler", "dev", "--port", String(port), "--local", "--log-level", "info", "--var", `TUNNEL_HOST:${TUNNEL_HOST}`, ...extra],
     { cwd: WRANGLER_DIR, env: { ...process.env, WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"] })
   pipeOut(wrangler, "wrangler")
   relay = `http://127.0.0.1:${port}`
@@ -240,13 +244,11 @@ async function transportCase(label, relayBase, env) {
   check("sse same URL works after reconnect", r.status === 200 && r.body.toString() === "hi ", `${r.status}`)
   const w = await wsEcho(pathBase.replace(/^http/, "ws") + "ws/after")
   check("sse public WS after reconnect", w.open && w.text === "text-echo", w.error ?? "")
-  c.kill("SIGTERM")
-  // The relay only learns that an SSE connector is gone when a write fails or
-  // the stream closes; then it keeps the tunnel for the 20 s reconnect grace.
-  console.log("waiting 22 s for the sse reconnect grace to expire…")
-  await sleep(22_000)
+  // Clean exit (Ctrl-C / SIGTERM): the CLI sends `bye`, so the relay tears the
+  // tunnel down at once instead of waiting for the reconnect grace.
+  c.kill("SIGTERM"); await sleep(3000)
   const r2 = await request(`${pathBase}hello`)
-  check("sse 503 after connector exits + grace", r2.status === 503, `${r2.status}`)
+  check("sse 503 within 3 s after clean exit", r2.status === 503, `${r2.status}`)
 }
 
 // 3. --keep-path

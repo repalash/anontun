@@ -1,4 +1,13 @@
 // Wire frames between connector ↔ relay.
+//
+// Two connector transports carry the same frames:
+//   ws   — one WebSocket on /_connect, frames in both directions (v0)
+//   sse  — relay → connector over a Server-Sent Events stream on
+//          /_connect/sse (one `data:` line per frame); connector → relay
+//          as POST /_respond/<token> with a frame (or array of frames) as
+//          the JSON body, authenticated by the `x-anontun-secret` header.
+//          For clients behind an HTTPS-only proxy that cannot upgrade to
+//          WebSocket (CI runners, agent sandboxes).
 
 export interface Env {
   TUNNEL: DurableObjectNamespace
@@ -7,8 +16,10 @@ export interface Env {
 // Connector → relay
 export interface RegisterFrame { type: "register" }
 
-// Relay → connector (after register)
-export interface RegisteredFrame { type: "registered"; token: string; url: string }
+// Relay → connector (after register). `secret` is only present on the sse
+// transport: the connector sends it back on every /_respond call and on
+// reconnect, so a public client that knows the token cannot forge responses.
+export interface RegisteredFrame { type: "registered"; token: string; url: string; secret?: string }
 
 // Relay → connector: a public client made an HTTP request
 export interface ReqOpenFrame {

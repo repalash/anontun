@@ -51,6 +51,37 @@ That URL is now reachable by anyone, anywhere. Send it to an AI chat, a webhook 
 - Request/response bodies up to 10 MB (v0 cap)
 - WebSocket upgrades end-to-end (the bit that breaks on `*.trycloudflare.com`)
 - One tunnel = one CLI process = one localhost service. New CLI = new token.
+- Two connector transports: WebSocket (default) and SSE + POST for hosts whose
+  egress proxy refuses WebSocket upgrades (see below)
+
+## Behind an HTTPS-only proxy (CI runners, agent sandboxes)
+
+Some sandboxes (Claude Code on the web, locked-down CI) route every connection
+through an intercepting HTTPS proxy: plain requests, chunked responses and
+Server-Sent Events pass, WebSocket upgrades and raw TCP do not. `cloudflared`,
+ngrok and the v0 anontun CLI all fail there.
+
+The CLI handles it with a second transport that only uses plain HTTPS:
+
+```
+npx anontun 3000                    # auto: tries ws, falls back to sse
+npx anontun --transport sse 3000    # force it
+ANONTUN_TRANSPORT=sse npx anontun 3000
+```
+
+- relay → connector: `GET /_connect/sse` is a `text/event-stream`; every frame
+  is one `data:` event, with a comment line every 15 s as keepalive.
+- connector → relay: `POST /_respond/<token>` with the frame as JSON body and
+  the `x-anontun-secret` header (the secret comes with the `registered` event,
+  so a public client that knows the token cannot forge responses).
+- If the stream drops, the CLI reconnects with `?token=&secret=`; the relay
+  keeps the tunnel and queues frames for 20 s.
+
+Public-side WebSockets still work in sse mode: the public client talks WS to
+the Worker, and only the connector leg is HTTP. Node 18+ is required for the
+built-in `fetch`; if the sandbox needs a proxy for outbound HTTPS and Node does
+not pick it up, run with `NODE_USE_ENV_PROXY=1` (Node 24+) or set
+`HTTPS_PROXY` for a proxy-aware fetch.
 
 ## What's deliberately omitted in v0
 
@@ -63,5 +94,5 @@ That URL is now reachable by anyone, anywhere. Send it to an AI chat, a webhook 
 ## Architecture
 
 - `relay/` — Cloudflare Worker + Durable Object (one DO instance per active tunnel, keyed by token).
-- `cli/` — Node CLI with the `ws` package. Opens a WS to `/_connect`, listens for framed requests, forwards to localhost.
+- `cli/` — Node CLI with the `ws` package. Opens a WS to `/_connect` (or an SSE stream to `/_connect/sse`), listens for framed requests, forwards to localhost.
 - Wire format documented in `relay/src/types.ts`.

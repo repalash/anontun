@@ -4,5 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Self-hostable anonymous HTTP/WS tunnel on Cloudflare. No login, no token.",
-  "workspaces": ["relay", "cli"]
+  "workspaces": [
+    "relay",
+    "cli"
+  ],
+  "scripts": {
+    "test": "node test/e2e.mjs"
+  }
 }

@@ -1,11 +1,18 @@
-// TunnelDO — one DO per active tunnel. Holds the connector's WebSocket and
-// proxies public HTTP/WS to it via id-correlated frames.
+// TunnelDO — one DO per active tunnel. Holds the connector (a WebSocket, or
+// an SSE stream plus POST-backs) and proxies public HTTP/WS to it via
+// id-correlated frames.
 
 import { Server, type Connection } from "partyserver"
 import type { Env, Frame, ReqOpenFrame, ResOpenFrame, WsFrameFrame, WsCloseFrame } from "./types"
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024  // 10 MB
 const REQUEST_TIMEOUT_MS = 30_000
+// sse: comment line written this often so idle proxies keep the stream open
+const SSE_KEEPALIVE_MS = 15_000
+// sse: how long a dropped stream may stay detached before the tunnel is torn down
+const SSE_RECONNECT_GRACE_MS = 20_000
+// sse: frames buffered while detached; beyond this the tunnel is torn down
+const SSE_MAX_QUEUED_FRAMES = 500
 
 type Pending =
   | { kind: "http"; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
@@ -15,10 +22,21 @@ interface ActiveWs {
   publicWs: WebSocket
 }
 
+type Connector =
+  | { kind: "ws"; c: Connection }
+  | {
+      kind: "sse"
+      secret: string
+      writer: WritableStreamDefaultWriter<Uint8Array> | null
+      queue: string[]
+      keepalive: ReturnType<typeof setInterval> | null
+      grace: ReturnType<typeof setTimeout> | null
+    }
+
 export class TunnelDO extends Server<Env> {
   static options = { hibernate: false }
 
-  connectorWs: Connection | null = null
+  connector: Connector | null = null
   token: string | null = null
   pending: Map<string, Pending> = new Map()
   activeWs: Map<string, ActiveWs> = new Map()
@@ -29,6 +47,21 @@ export class TunnelDO extends Server<Env> {
   // so we have to distinguish here based on the URL path:
   //   /_connect            → the connector (origin-side, holds the tunnel)
   //   /t/<token>/<rest>    → a public client opening a WS through the tunnel
+
+  // Public-side WebSocket upgrades bypass PartyServer's onConnect and are
+  // answered by handleWsUpgrade with our own WebSocketPair. PartyServer
+  // sends the 101 itself, before onConnect runs, so there is no way to echo
+  // the client's requested subprotocol (Sec-WebSocket-Protocol) on that
+  // path — and browsers drop a WebSocket whose 101 does not echo it (Vite's
+  // HMR client is the common case). Only the connector's /_connect upgrade
+  // still goes through PartyServer.
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url)
+    if (url.pathname.startsWith("/t/") && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      return this.onRequest(req)
+    }
+    return super.fetch(req)
+  }
 
   async onConnect(c: Connection, ctx: { request: Request }): Promise<void> {
     const url = new URL(ctx.request.url)
@@ -47,7 +80,7 @@ export class TunnelDO extends Server<Env> {
   }
 
   private handleConnectorOpen(c: Connection, req: Request): void {
-    if (this.connectorWs) {
+    if (this.connector) {
       c.close(4409, "tunnel already has a connector")
       return
     }
@@ -57,13 +90,14 @@ export class TunnelDO extends Server<Env> {
       return
     }
     const base = req.headers.get("x-anontun-base") ?? ""
+    const url = req.headers.get("x-anontun-url") ?? `${base}/t/${token}/`
     this.token = token
-    this.connectorWs = c
-    c.send(JSON.stringify({ type: "registered", token, url: `${base}/t/${token}/` }))
+    this.connector = { kind: "ws", c }
+    c.send(JSON.stringify({ type: "registered", token, url }))
   }
 
   private async handlePublicWsOpen(publicWs: Connection, req: Request): Promise<void> {
-    if (!this.connectorWs) {
+    if (!this.connector) {
       publicWs.close(4503, "connector_offline")
       return
     }
@@ -130,12 +164,23 @@ export class TunnelDO extends Server<Env> {
   }
 
   onClose(c: Connection): void {
-    if (c !== this.connectorWs) {
+    if (this.connector?.kind !== "ws" || c !== this.connector.c) {
       // A public-side WS closed. The per-connection close listener in
       // handlePublicWsOpen sends the ws_close frame; nothing else to do.
       return
     }
     // The connector dropped. Tear everything down.
+    this.teardownConnector()
+  }
+
+  private teardownConnector(): void {
+    if (this.connector?.kind === "sse") {
+      if (this.connector.keepalive) clearInterval(this.connector.keepalive)
+      if (this.connector.grace) clearTimeout(this.connector.grace)
+      const w = this.connector.writer
+      this.connector.writer = null
+      if (w) w.close().catch(() => {})
+    }
     for (const p of this.pending.values()) {
       clearTimeout(p.timer)
       if (p.kind === "http") p.resolve(jsonError("connector_offline", "connector dropped", 503))
@@ -146,7 +191,98 @@ export class TunnelDO extends Server<Env> {
       try { a.publicWs.close(1011, "connector dropped") } catch {}
     }
     this.activeWs.clear()
-    this.connectorWs = null
+    this.connector = null
+  }
+
+  // ── SSE connector transport ─────────────────────────────────────
+  //
+  // Relay → connector: text/event-stream, one `data: <frame json>` event per
+  // frame, a comment line every SSE_KEEPALIVE_MS.
+  // Connector → relay: POST /_respond/<token> with x-anontun-secret.
+  // A dropped stream leaves the tunnel in a detached state for
+  // SSE_RECONNECT_GRACE_MS; frames queue up and flush when the connector
+  // re-attaches with ?token=&secret=.
+
+  private handleConnectorSseOpen(req: Request): Response {
+    const token = req.headers.get("x-anontun-token")
+    if (!token) return jsonError("bad_request", "missing token header", 400)
+    const base = req.headers.get("x-anontun-base") ?? ""
+    const publicUrl = req.headers.get("x-anontun-url") ?? `${base}/t/${token}/`
+    const reconnect = req.headers.get("x-anontun-reconnect") === "1"
+    const url = new URL(req.url)
+
+    if (this.connector?.kind === "ws") {
+      return jsonError("conflict", "tunnel already has a websocket connector", 409)
+    }
+
+    let conn: Extract<Connector, { kind: "sse" }>
+    if (reconnect) {
+      const secret = url.searchParams.get("secret") ?? ""
+      if (!this.connector || this.token !== token || !timingSafeEqual(secret, this.connector.secret)) {
+        return jsonError("forbidden", "unknown tunnel or bad secret", 403)
+      }
+      conn = this.connector
+      // Replace a stream that is still attached (e.g. the old one is half-dead).
+      if (conn.writer) { const w = conn.writer; conn.writer = null; w.close().catch(() => {}) }
+      if (conn.keepalive) { clearInterval(conn.keepalive); conn.keepalive = null }
+      if (conn.grace) { clearTimeout(conn.grace); conn.grace = null }
+    } else {
+      if (this.connector) return jsonError("conflict", "tunnel already has a connector", 409)
+      conn = { kind: "sse", secret: generateSecret(), writer: null, queue: [], keepalive: null, grace: null }
+      this.token = token
+      this.connector = conn
+    }
+
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+    const writer = writable.getWriter()
+    conn.writer = writer
+
+    const detach = () => this.onSseDetached(conn, writer)
+    writer.closed.then(detach, detach)
+    req.signal?.addEventListener("abort", detach)
+
+    const enc = new TextEncoder()
+    const write = (s: string) => writer.write(enc.encode(s)).catch(detach)
+
+    write(`: anontun sse\n\n`)
+    write(`data: ${JSON.stringify({ type: "registered", token, url: publicUrl, secret: conn.secret })}\n\n`)
+    for (const f of conn.queue.splice(0)) write(`data: ${f}\n\n`)
+    conn.keepalive = setInterval(() => { write(`: keepalive\n\n`) }, SSE_KEEPALIVE_MS)
+
+    return new Response(readable, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+      },
+    })
+  }
+
+  private onSseDetached(conn: Extract<Connector, { kind: "sse" }>, writer: WritableStreamDefaultWriter<Uint8Array>): void {
+    // Ignore callbacks from a stream that has already been replaced.
+    if (this.connector !== conn || conn.writer !== writer) return
+    conn.writer = null
+    writer.close().catch(() => {})
+    if (conn.keepalive) { clearInterval(conn.keepalive); conn.keepalive = null }
+    if (conn.grace) clearTimeout(conn.grace)
+    conn.grace = setTimeout(() => {
+      if (this.connector === conn && !conn.writer) this.teardownConnector()
+    }, SSE_RECONNECT_GRACE_MS)
+  }
+
+  private async handleRespond(req: Request): Promise<Response> {
+    const conn = this.connector
+    if (!conn || conn.kind !== "sse") return jsonError("not_found", "no sse tunnel", 404)
+    const secret = req.headers.get("x-anontun-secret") ?? ""
+    if (!timingSafeEqual(secret, conn.secret)) return jsonError("forbidden", "bad secret", 403)
+
+    let parsed: unknown
+    try { parsed = await req.json() } catch { return jsonError("bad_request", "body must be a JSON frame or array of frames", 400) }
+    const frames = Array.isArray(parsed) ? parsed : [parsed]
+    for (const f of frames) {
+      if (f && typeof f === "object" && typeof (f as Frame).type === "string") this.handleConnectorFrame(f as Frame)
+    }
+    return new Response(null, { status: 204 })
   }
 
   // ── Connector → relay frames ────────────────────────────────────
@@ -156,18 +292,22 @@ export class TunnelDO extends Server<Env> {
     // messages are forwarded to the connector via the addEventListener
     // wired up in handlePublicWsOpen — they don't go through this method's
     // handlers. Ignore them here so they don't accidentally get parsed as JSON.
-    if (c !== this.connectorWs) return
+    if (this.connector?.kind !== "ws" || c !== this.connector.c) return
 
     const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw)
     let msg: Frame
     try { msg = JSON.parse(text) as Frame } catch { return }
+    this.handleConnectorFrame(msg)
+  }
 
+  private handleConnectorFrame(msg: Frame): void {
     switch (msg.type) {
       case "res_open": this.handleResOpen(msg); return
       case "ws_frame": this.handleWsFrame(msg); return
       case "ws_close": this.handleWsClose(msg); return
       case "ping":     this.send({ type: "pong", id: msg.id }); return
       case "pong":     return
+      case "bye":      this.teardownConnector(); return
       default:         return
     }
   }
@@ -216,11 +356,16 @@ export class TunnelDO extends Server<Env> {
   // ── Public-side entry ──────────────────────────────────────────
 
   async onRequest(req: Request): Promise<Response> {
-    if (!this.connectorWs) {
+    const url = new URL(req.url)
+
+    // Connector-side, non-WebSocket endpoints (sse transport).
+    if (url.pathname === "/_connect/sse") return this.handleConnectorSseOpen(req)
+    if (url.pathname.startsWith("/_respond/")) return this.handleRespond(req)
+
+    if (!this.connector) {
       return jsonError("connector_offline", "no live connector", 503)
     }
 
-    const url = new URL(req.url)
     const m = url.pathname.match(/^\/t\/[^/]+(\/.*)?$/)
     const innerPath = (m?.[1] ?? "/") + url.search
 
@@ -265,7 +410,7 @@ export class TunnelDO extends Server<Env> {
     if (!ok) {
       const p = this.pending.get(id)
       if (p) { clearTimeout(p.timer); this.pending.delete(id) }
-      return jsonError("connector_offline", "ws send failed", 503)
+      return jsonError("connector_offline", "connector send failed", 503)
     }
     return promise
   }
@@ -291,7 +436,7 @@ export class TunnelDO extends Server<Env> {
     })
     if (!ok) {
       this.pending.delete(id)
-      return jsonError("connector_offline", "ws send failed", 503)
+      return jsonError("connector_offline", "connector send failed", 503)
     }
 
     const result = await handshake
@@ -318,19 +463,43 @@ export class TunnelDO extends Server<Env> {
     server.addEventListener("close", (ev) => {
       this.activeWs.delete(id)
       this.send({ type: "ws_close", id, code: ev.code, reason: ev.reason })
+      // Complete the closing handshake towards the public client; the runtime
+      // does not echo the close frame by itself, and `ws` clients otherwise
+      // wait ~30 s before giving up.
+      try { server.close(ev.code, ev.reason) } catch {}
     })
     server.addEventListener("error", () => {
       this.activeWs.delete(id)
       this.send({ type: "ws_close", id })
     })
 
-    return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket })
+    // Echo the subprotocol the local origin negotiated, if any.
+    const respHeaders = new Headers()
+    const proto = result.headers?.["sec-websocket-protocol"]
+    if (proto) respHeaders.set("sec-websocket-protocol", proto)
+    return new Response(null, { status: 101, headers: respHeaders, webSocket: client } as ResponseInit & { webSocket: WebSocket })
   }
 
   private send(frame: Frame): boolean {
-    if (!this.connectorWs) return false
-    try { this.connectorWs.send(JSON.stringify(frame)); return true }
-    catch { return false }
+    const conn = this.connector
+    if (!conn) return false
+    const json = JSON.stringify(frame)
+    if (conn.kind === "ws") {
+      try { conn.c.send(json); return true }
+      catch { return false }
+    }
+    if (conn.writer) {
+      const w = conn.writer
+      w.write(new TextEncoder().encode(`data: ${json}\n\n`)).catch(() => this.onSseDetached(conn, w))
+      return true
+    }
+    // Detached (stream dropped, connector may re-attach within the grace window).
+    if (conn.queue.length >= SSE_MAX_QUEUED_FRAMES) {
+      this.teardownConnector()
+      return false
+    }
+    conn.queue.push(json)
+    return true
   }
 }
 
@@ -344,6 +513,18 @@ function jsonError(code: string, message: string, status: number): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   })
+}
+
+function generateSecret(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(24))
+  return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
 }
 
 function base64Encode(bytes: Uint8Array): string {

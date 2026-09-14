@@ -35,3 +35,10 @@ agent-socket has a scenario harness (`packages/agent-socket/harness/`) that's th
 - `npm test` from `packages/anontun/` runs the harness, all scenarios pass in < 30s total
 - CI-friendly (no interactive prompts, no hardcoded ports — bind 0, read assigned port)
 - A regression of any of the 3 known bugs makes the corresponding scenario fail loudly
+
+## Done (2026-09-13)
+
+`test/e2e.mjs` (`npm test`): one file, real processes — `wrangler dev`, an HTTP + WS echo
+origin, a proxy that refuses WebSocket upgrades, and the CLI. Covers both connector transports,
+public WS (text/binary/subprotocol/close), host-based routing, `--keep-path`, reconnect after a
+cut stream, teardown after the CLI exits. `RELAY=<url>` runs it against a deployed relay.

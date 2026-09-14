@@ -1,32 +1,238 @@
-// anontun connector. Opens a WS to the relay, handles incoming framed
-// HTTP/WS requests by forwarding to the local origin URL.
+// anontun connector. Attaches to the relay over one of two transports and
+// handles incoming framed HTTP/WS requests by forwarding to the local origin.
+//
+//   ws   — one WebSocket to /_connect (frames both ways)
+//   sse  — GET /_connect/sse streams relay → connector frames as Server-Sent
+//          Events; connector → relay frames go as POST /_respond/<token>.
+//          Plain HTTPS only, so it works behind proxies that refuse WebSocket
+//          upgrades (CI runners, agent sandboxes). Reconnects with the token
+//          and secret if the stream drops.
+//
+// `transport: "auto"` tries ws first and falls back to sse if the upgrade is
+// refused before the relay registers the tunnel.
 
 import { WebSocket } from "ws"
 import http from "node:http"
 import https from "node:https"
 import { URL } from "node:url"
+import { ConnectProxyAgent, proxyUrlFor } from "./proxy-agent.mjs"
 
-export async function startConnector({ relayBase, originUrl }) {
-  const wsBase = relayBase.replace(/^http/, "ws").replace(/\/+$/, "")
+const SSE_RECONNECT_ATTEMPTS = 10
+const SSE_RECONNECT_DELAY_MS = 1000
+
+// Clean shutdown: tell the relay we are leaving so the public URL turns into
+// a 503 right away instead of after a stream timeout + reconnect grace.
+let onShutdown = null
+let shuttingDown = false
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    if (shuttingDown) process.exit(0)
+    shuttingDown = true
+    try { await Promise.race([onShutdown?.(), sleep(2000)]) } catch {}
+    process.exit(0)
+  })
+}
+
+// keepPath: forward the public path with its /t/<token> prefix intact instead
+// of stripped. Needed for apps that must be served under that prefix — e.g. a
+// Vite dev server started with base=/t/<token>/ — otherwise the origin sees
+// "/" and redirects to its base, which loops back through the relay.
+export async function startConnector({ relayBase, originUrl, transport = "auto", keepPath = false }) {
+  relayBase = relayBase.replace(/\/+$/, "")
+
+  if (transport === "ws" || transport === "auto") {
+    try {
+      await runWsTransport({ relayBase, originUrl, keepPath })
+      return
+    } catch (e) {
+      if (transport === "ws") throw e
+      console.error(`anontun: websocket transport failed (${e?.message ?? e}); falling back to sse`)
+    }
+  }
+  await runSseTransport({ relayBase, originUrl, keepPath })
+}
+
+// ── ws transport ───────────────────────────────────────────────
+
+function runWsTransport({ relayBase, originUrl, keepPath }) {
+  const wsBase = relayBase.replace(/^http/, "ws")
   const wsUrl = `${wsBase}/_connect`
 
-  const ws = new WebSocket(wsUrl)
-  const upstreamWss = new Map()  // id → upstream WS connections to local origin
+  return new Promise((resolve, reject) => {
+    // The `ws` package ignores HTTPS_PROXY; tunnel the relay socket through
+    // the proxy with a CONNECT agent when one is configured.
+    const wsOpts = {}
+    const proxyUrl = wsUrl.startsWith("wss:") ? proxyUrlFor(relayBase) : null
+    if (proxyUrl) {
+      wsOpts.agent = new ConnectProxyAgent(proxyUrl)
+      if (process.env.ANONTUN_DEBUG) console.error(`[anontun] relay via proxy ${new URL(proxyUrl).host}`)
+    }
+    const ws = new WebSocket(wsUrl, wsOpts)
+    let registered = false
+    onShutdown = () => new Promise((r) => { ws.once("close", r); try { ws.close(1000, "bye") } catch { r() } })
 
-  ws.on("open", () => {
-    // Server sends 'registered' with our token + URL right after opening.
-  })
+    const origin = createOriginBridge(originUrl, keepPath, (frame) => {
+      if (ws.readyState !== WebSocket.OPEN) return
+      try { ws.send(JSON.stringify(frame)) } catch {}
+    })
 
-  ws.on("message", (raw) => {
-    let msg
-    try { msg = JSON.parse(raw.toString()) } catch { return }
-    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] recv: ${msg.type} id=${msg.id ?? ""} ${msg.upgrade ? "(upgrade)" : ""}`)
-    switch (msg.type) {
-      case "registered":
-        console.log(`\n  ${msg.url}\n`)
-        console.log(`  → ${originUrl}\n`)
-        console.log(`  (Ctrl-C to stop)\n`)
+    ws.on("message", (raw) => {
+      let msg
+      try { msg = JSON.parse(raw.toString()) } catch { return }
+      if (msg.type === "registered") {
+        origin.setToken(msg.token)
+        if (!registered) {
+          registered = true
+          printRegistered(msg.url, originUrl, "ws")
+          resolve()
+        }
         return
+      }
+      origin.handleFrame(msg)
+    })
+
+    ws.on("close", (code, reason) => {
+      if (shuttingDown) return
+      if (!registered) {
+        reject(new Error(`ws closed before register code=${code} reason=${reason?.toString() ?? ""}`))
+        return
+      }
+      console.error(`anontun: ws closed code=${code} reason=${reason?.toString() ?? ""}`)
+      process.exit(1)
+    })
+    ws.on("error", (err) => {
+      if (shuttingDown) return
+      if (!registered) {
+        reject(new Error(`ws error: ${err.message}`))
+        return
+      }
+      console.error(`anontun: ws error: ${err.message}`)
+      process.exit(1)
+    })
+  })
+}
+
+// ── sse transport ──────────────────────────────────────────────
+
+async function runSseTransport({ relayBase, originUrl, keepPath }) {
+  let token = null
+  let secret = null
+  let announced = false
+
+  // Frames that belong to one WS stream must arrive in order, so POSTs are
+  // chained per id. HTTP responses (one per id) go out in parallel.
+  const chains = new Map()
+  const post = async (frame) => {
+    const res = await fetch(`${relayBase}/_respond/${token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-anontun-secret": secret },
+      body: JSON.stringify(frame),
+    })
+    if (res.status === 403 || res.status === 404) {
+      throw new Error(`relay rejected frame (${res.status}); tunnel is gone`)
+    }
+    if (!res.ok) console.error(`anontun: /_respond returned ${res.status}`)
+  }
+  const send = (frame) => {
+    if (!token || !secret) return
+    const prev = chains.get(frame.id) ?? Promise.resolve()
+    const next = prev.then(() => post(frame)).catch((e) => {
+      console.error(`anontun: ${e.message}`)
+      if (/tunnel is gone/.test(e.message)) process.exit(1)
+    })
+    chains.set(frame.id, next)
+    next.then(() => { if (chains.get(frame.id) === next) chains.delete(frame.id) })
+  }
+
+  const origin = createOriginBridge(originUrl, keepPath, send)
+  onShutdown = () => (token && secret) ? post({ type: "bye" }) : Promise.resolve()
+
+  for (let attempt = 0; ; attempt++) {
+    const url = token
+      ? `${relayBase}/_connect/sse?token=${encodeURIComponent(token)}&secret=${encodeURIComponent(secret)}`
+      : `${relayBase}/_connect/sse`
+    let res
+    try {
+      res = await fetch(url, { headers: { accept: "text/event-stream" } })
+    } catch (e) {
+      if (attempt >= SSE_RECONNECT_ATTEMPTS) throw new Error(`sse connect failed: ${e.message}`)
+      await sleep(SSE_RECONNECT_DELAY_MS)
+      continue
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      // 403/409 mean the tunnel is gone or taken; a fresh token will not help either.
+      throw new Error(`relay answered ${res.status} on /_connect/sse: ${text.slice(0, 200)}`)
+    }
+    if (!/text\/event-stream/.test(res.headers.get("content-type") ?? "")) {
+      throw new Error(`relay did not open an event stream (content-type ${res.headers.get("content-type")})`)
+    }
+
+    attempt = 0
+    let dropReason = "stream ended"
+    try {
+      await readSse(res.body, (msg) => {
+        if (msg.type === "registered") {
+          token = msg.token
+          secret = msg.secret
+          origin.setToken(token)
+          if (!announced) { announced = true; printRegistered(msg.url, originUrl, "sse") }
+          return
+        }
+        origin.handleFrame(msg)
+      })
+    } catch (e) {
+      // An abrupt socket close surfaces as a read error ("terminated",
+      // ECONNRESET), not as a clean end of stream. Treat both as a drop.
+      dropReason = e?.message ?? String(e)
+      if (!token) throw new Error(`sse stream failed before the relay registered the tunnel: ${dropReason}`)
+    }
+
+    if (!token) throw new Error("sse stream ended before the relay registered the tunnel")
+    console.error(`anontun: sse stream dropped (${dropReason}); reconnecting`)
+    await sleep(SSE_RECONNECT_DELAY_MS)
+  }
+}
+
+// Parse a text/event-stream body; calls onEvent with each JSON `data:` payload.
+async function readSse(body, onEvent) {
+  const reader = body.getReader()
+  const dec = new TextDecoder()
+  let buf = ""
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const block = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n")
+      if (!data) continue  // comment / keepalive
+      let msg
+      try { msg = JSON.parse(data) } catch { continue }
+      if (process.env.ANONTUN_DEBUG) console.error(`[anontun] recv: ${msg.type} id=${msg.id ?? ""} ${msg.upgrade ? "(upgrade)" : ""}`)
+      onEvent(msg)
+    }
+  }
+}
+
+// ── origin bridge (shared by both transports) ──────────────────
+//
+// Turns relay frames into requests against the local origin and hands the
+// answers to `sendFrame`.
+
+function createOriginBridge(originUrl, keepPath, sendFrame) {
+  const upstreamWss = new Map()  // id → upstream WS connections to local origin
+  let pathPrefix = ""            // "/t/<token>" when keepPath, set on register
+
+  function setToken(token) {
+    if (keepPath) pathPrefix = `/t/${token}`
+  }
+
+  function handleFrame(msg) {
+    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] frame: ${msg.type} id=${msg.id ?? ""} ${msg.upgrade ? "(upgrade)" : ""}`)
+    switch (msg.type) {
       case "req_open":
         if (msg.upgrade) handleUpgrade(msg)
         else handleHttp(msg)
@@ -38,24 +244,15 @@ export async function startConnector({ relayBase, originUrl }) {
         closeUpstreamWs(msg.id, msg.code, msg.reason)
         return
       case "ping":
-        ws.send(JSON.stringify({ type: "pong", id: msg.id }))
+        sendFrame({ type: "pong", id: msg.id })
         return
     }
-  })
-
-  ws.on("close", (code, reason) => {
-    console.error(`anontun: ws closed code=${code} reason=${reason?.toString() ?? ""}`)
-    process.exit(1)
-  })
-  ws.on("error", (err) => {
-    console.error(`anontun: ws error: ${err.message}`)
-    process.exit(1)
-  })
+  }
 
   // ── HTTP request handler ─────────────────────────────────────
 
   function handleHttp(msg) {
-    const target = new URL(msg.path, originUrl)
+    const target = new URL(pathPrefix + msg.path, originUrl)
     const lib = target.protocol === "https:" ? https : http
     const headers = { ...msg.headers }
     // Don't forward our own host header — set the local origin's host.
@@ -114,10 +311,16 @@ export async function startConnector({ relayBase, originUrl }) {
 
   function handleUpgrade(msg) {
     const wsScheme = originUrl.startsWith("https:") ? "wss:" : "ws:"
-    const target = new URL(msg.path, originUrl)
+    const target = new URL(pathPrefix + msg.path, originUrl)
     const targetUrl = `${wsScheme}//${target.host}${target.pathname}${target.search}`
 
-    const upstream = new WebSocket(targetUrl, {
+    // Forward the requested subprotocols (e.g. Vite's HMR client sends
+    // `vite-hmr`; the dev server ignores upgrades without it). The `ws`
+    // client emits the header itself, so it is stripped from the passthrough
+    // set and re-supplied here as the protocols argument.
+    const protocols = (msg.headers?.["sec-websocket-protocol"] ?? "")
+      .split(",").map((p) => p.trim()).filter(Boolean)
+    const upstream = new WebSocket(targetUrl, protocols, {
       headers: stripHopByHop(msg.headers),
     })
     upstream.binaryType = "arraybuffer"
@@ -188,10 +391,13 @@ export async function startConnector({ relayBase, originUrl }) {
     upstreamWss.delete(id)
   }
 
-  function sendFrame(frame) {
-    if (ws.readyState !== WebSocket.OPEN) return
-    try { ws.send(JSON.stringify(frame)) } catch {}
-  }
+  return { handleFrame, setToken }
+}
+
+function printRegistered(url, originUrl, transport) {
+  console.log(`\n  ${url}\n`)
+  console.log(`  → ${originUrl}  (${transport})\n`)
+  console.log(`  (Ctrl-C to stop)\n`)
 }
 
 function stripHopByHop(headers) {
@@ -202,4 +408,8 @@ function stripHopByHop(headers) {
     out[k] = v
   }
   return out
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
 }

@@ -1,14 +1,31 @@
 // Wire frames between connector ↔ relay.
+//
+// Two connector transports carry the same frames:
+//   ws   — one WebSocket on /_connect, frames in both directions (v0)
+//   sse  — relay → connector over a Server-Sent Events stream on
+//          /_connect/sse (one `data:` line per frame); connector → relay
+//          as POST /_respond/<token> with a frame (or array of frames) as
+//          the JSON body, authenticated by the `x-anontun-secret` header.
+//          For clients behind an HTTPS-only proxy that cannot upgrade to
+//          WebSocket (CI runners, agent sandboxes).
 
 export interface Env {
   TUNNEL: DurableObjectNamespace
+  // Optional. When set (e.g. "tunnel.ijewel.info"), every tunnel is also
+  // reachable as https://<token>.<TUNNEL_HOST>/ with the path passed through
+  // unchanged, and that is the URL handed to the connector. Needs a wildcard
+  // DNS record + Worker route for *.<TUNNEL_HOST>. Path form /t/<token>/ on
+  // the bare host keeps working either way.
+  TUNNEL_HOST?: string
 }
 
 // Connector → relay
 export interface RegisterFrame { type: "register" }
 
-// Relay → connector (after register)
-export interface RegisteredFrame { type: "registered"; token: string; url: string }
+// Relay → connector (after register). `secret` is only present on the sse
+// transport: the connector sends it back on every /_respond call and on
+// reconnect, so a public client that knows the token cannot forge responses.
+export interface RegisteredFrame { type: "registered"; token: string; url: string; secret?: string }
 
 // Relay → connector: a public client made an HTTP request
 export interface ReqOpenFrame {
@@ -49,6 +66,10 @@ export interface WsCloseFrame {
   reason?: string
 }
 
+// Connector → relay: clean shutdown (Ctrl-C). The relay tears the tunnel down
+// at once instead of waiting for the stream to time out.
+export interface ByeFrame { type: "bye" }
+
 // Heartbeat
 export interface PingFrame { type: "ping"; id: string }
 export interface PongFrame { type: "pong"; id: string }
@@ -58,3 +79,4 @@ export type Frame =
   | ReqOpenFrame | ResOpenFrame
   | WsFrameFrame | WsCloseFrame
   | PingFrame | PongFrame
+  | ByeFrame

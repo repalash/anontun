@@ -140,6 +140,16 @@ function startConnector(relayBase, extra = [], env = {}) {
   c.url = async () => waitFor(() => { const m = c._out.match(/\n\s+(https?:\/\/\S+\/)\n/); return m?.[1] }, 20_000, "registered URL")
   return c
 }
+// The tunnel's token, from either URL shape: https://relay/t/<token>/ or
+// https://<token>.tunnel.example.com/. A regex alternation over the whole URL
+// is not safe here — "//<label>." matches the relay's own host first when the
+// relay has a dotted hostname, so parse the URL instead.
+function tokenFromUrl(u) {
+  const url = new URL(u)
+  const m = url.pathname.match(/^\/t\/([^/]+)/)
+  return m ? m[1] : url.hostname.split(".")[0]
+}
+
 function request(url, { method = "GET", body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url)
@@ -200,7 +210,7 @@ async function transportCase(label, relayBase, env) {
   // Public-side requests go straight to the relay (host header when host-based).
   // For local runs the host-based hostname does not resolve, so use the path form
   // on the relay and cover host-based routing separately below.
-  const token = url.match(/\/t\/([0-9a-z]+)\/|\/\/([0-9a-z]+)\./)?.slice(1).find(Boolean)
+  const token = tokenFromUrl(url)
   const pathBase = `${relay}/t/${token}/`
   await httpSuite(label, pathBase)
   const wsRes = await wsEcho(pathBase.replace(/^http/, "ws") + "ws/chat?room=1", { protocol: "chat-v1" })
@@ -256,7 +266,7 @@ async function transportCase(label, relayBase, env) {
   console.log("\n== keep-path ==")
   const c = startConnector(relay, ["--keep-path"], { ANONTUN_TRANSPORT: "ws" })
   const url = await c.url()
-  const token = url.match(/\/t\/([0-9a-z]+)\/|\/\/([0-9a-z]+)\./)?.slice(1).find(Boolean)
+  const token = tokenFromUrl(url)
   const pathBase = `${relay}/t/${token}/`
   const r = await request(`${pathBase}echo?k=1`)
   let e = {}; try { e = JSON.parse(r.body.toString()) } catch {}

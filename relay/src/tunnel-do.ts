@@ -9,10 +9,12 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024  // 10 MB
 const REQUEST_TIMEOUT_MS = 30_000
 // sse: comment line written this often so idle proxies keep the stream open
 const SSE_KEEPALIVE_MS = 15_000
-// sse: how long a dropped stream may stay detached before the tunnel is torn down
-const SSE_RECONNECT_GRACE_MS = 20_000
-// sse: frames buffered while detached; beyond this the tunnel is torn down
-const SSE_MAX_QUEUED_FRAMES = 500
+// How long a dropped connector (ws socket or sse stream) may stay detached
+// before the tunnel is torn down. The CLI re-attaches with its token + secret
+// inside this window, so the public URL survives a drop.
+const RECONNECT_GRACE_MS = 20_000
+// Frames buffered while detached; beyond this the tunnel is torn down.
+const MAX_QUEUED_FRAMES = 500
 
 type Pending =
   | { kind: "http"; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
@@ -23,7 +25,14 @@ interface ActiveWs {
 }
 
 type Connector =
-  | { kind: "ws"; c: Connection }
+  | {
+      kind: "ws"
+      // null while the socket is gone and the connector may still re-attach.
+      c: Connection | null
+      secret: string
+      queue: string[]
+      grace: ReturnType<typeof setTimeout> | null
+    }
   | {
       kind: "sse"
       secret: string
@@ -80,10 +89,6 @@ export class TunnelDO extends Server<Env> {
   }
 
   private handleConnectorOpen(c: Connection, req: Request): void {
-    if (this.connector) {
-      c.close(4409, "tunnel already has a connector")
-      return
-    }
     const token = req.headers.get("x-anontun-token")
     if (!token) {
       c.close(4500, "missing token header")
@@ -91,9 +96,40 @@ export class TunnelDO extends Server<Env> {
     }
     const base = req.headers.get("x-anontun-base") ?? ""
     const url = req.headers.get("x-anontun-url") ?? `${base}/t/${token}/`
-    this.token = token
-    this.connector = { kind: "ws", c }
-    c.send(JSON.stringify({ type: "registered", token, url }))
+    const reconnect = req.headers.get("x-anontun-reconnect") === "1"
+
+    let conn: Extract<Connector, { kind: "ws" }>
+    if (reconnect) {
+      // The CLI lost its socket and is coming back for the same tunnel, so the
+      // public URL survives the drop. The secret proves it is the same CLI.
+      const secret = new URL(req.url).searchParams.get("secret") ?? ""
+      if (
+        this.connector?.kind !== "ws" ||
+        this.token !== token ||
+        !timingSafeEqual(secret, this.connector.secret)
+      ) {
+        c.close(4403, "unknown tunnel or bad secret")
+        return
+      }
+      conn = this.connector
+      // Drop a socket that is still half-open, then take over.
+      if (conn.c && conn.c !== c) { try { conn.c.close(1000, "replaced") } catch {} }
+      if (conn.grace) { clearTimeout(conn.grace); conn.grace = null }
+      conn.c = c
+    } else {
+      if (this.connector) {
+        c.close(4409, "tunnel already has a connector")
+        return
+      }
+      conn = { kind: "ws", c, secret: generateSecret(), queue: [], grace: null }
+      this.token = token
+      this.connector = conn
+    }
+
+    c.send(JSON.stringify({ type: "registered", token, url, secret: conn.secret }))
+    for (const f of conn.queue.splice(0)) {
+      try { c.send(f) } catch {}
+    }
   }
 
   private async handlePublicWsOpen(publicWs: Connection, req: Request): Promise<void> {
@@ -164,16 +200,28 @@ export class TunnelDO extends Server<Env> {
   }
 
   onClose(c: Connection): void {
-    if (this.connector?.kind !== "ws" || c !== this.connector.c) {
+    const conn = this.connector
+    if (conn?.kind !== "ws" || c !== conn.c) {
       // A public-side WS closed. The per-connection close listener in
       // handlePublicWsOpen sends the ws_close frame; nothing else to do.
       return
     }
-    // The connector dropped. Tear everything down.
-    this.teardownConnector()
+    // The connector's socket dropped. Intermediaries cut idle WebSockets, so
+    // this is routine: keep the tunnel (and its URL) for the re-attach window
+    // and only tear down if the CLI does not come back. A clean shutdown sends
+    // `bye` first, which tears down immediately.
+    conn.c = null
+    if (conn.grace) clearTimeout(conn.grace)
+    conn.grace = setTimeout(() => {
+      if (this.connector === conn && !conn.c) this.teardownConnector()
+    }, RECONNECT_GRACE_MS)
   }
 
   private teardownConnector(): void {
+    if (this.connector?.kind === "ws" && this.connector.grace) {
+      clearTimeout(this.connector.grace)
+      this.connector.grace = null
+    }
     if (this.connector?.kind === "sse") {
       if (this.connector.keepalive) clearInterval(this.connector.keepalive)
       if (this.connector.grace) clearTimeout(this.connector.grace)
@@ -200,7 +248,7 @@ export class TunnelDO extends Server<Env> {
   // frame, a comment line every SSE_KEEPALIVE_MS.
   // Connector → relay: POST /_respond/<token> with x-anontun-secret.
   // A dropped stream leaves the tunnel in a detached state for
-  // SSE_RECONNECT_GRACE_MS; frames queue up and flush when the connector
+  // RECONNECT_GRACE_MS; frames queue up and flush when the connector
   // re-attaches with ?token=&secret=.
 
   private handleConnectorSseOpen(req: Request): Response {
@@ -267,7 +315,7 @@ export class TunnelDO extends Server<Env> {
     if (conn.grace) clearTimeout(conn.grace)
     conn.grace = setTimeout(() => {
       if (this.connector === conn && !conn.writer) this.teardownConnector()
-    }, SSE_RECONNECT_GRACE_MS)
+    }, RECONNECT_GRACE_MS)
   }
 
   private async handleRespond(req: Request): Promise<Response> {
@@ -485,8 +533,17 @@ export class TunnelDO extends Server<Env> {
     if (!conn) return false
     const json = JSON.stringify(frame)
     if (conn.kind === "ws") {
-      try { conn.c.send(json); return true }
-      catch { return false }
+      if (conn.c) {
+        try { conn.c.send(json); return true }
+        catch { /* socket died between the check and the send — queue it below */ }
+      }
+      // Detached: hold frames for the re-attach window.
+      if (conn.queue.length >= MAX_QUEUED_FRAMES) {
+        this.teardownConnector()
+        return false
+      }
+      conn.queue.push(json)
+      return true
     }
     if (conn.writer) {
       const w = conn.writer
@@ -494,7 +551,7 @@ export class TunnelDO extends Server<Env> {
       return true
     }
     // Detached (stream dropped, connector may re-attach within the grace window).
-    if (conn.queue.length >= SSE_MAX_QUEUED_FRAMES) {
+    if (conn.queue.length >= MAX_QUEUED_FRAMES) {
       this.teardownConnector()
       return false
     }

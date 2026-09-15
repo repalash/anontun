@@ -19,6 +19,8 @@ import { ConnectProxyAgent, proxyUrlFor } from "./proxy-agent.mjs"
 
 const SSE_RECONNECT_ATTEMPTS = 10
 const SSE_RECONNECT_DELAY_MS = 1000
+const WS_RECONNECT_ATTEMPTS = 10
+const WS_RECONNECT_DELAY_MS = 1000
 
 // Clean shutdown: tell the relay we are leaving so the public URL turns into
 // a 503 right away instead of after a stream timeout + reconnect grace.
@@ -54,61 +56,114 @@ export async function startConnector({ relayBase, originUrl, transport = "auto",
 
 // ── ws transport ───────────────────────────────────────────────
 
+// Heartbeat so idle-connection reapers (proxies, the Cloudflare edge) do not
+// cut a tunnel that is simply quiet. The relay answers `ping` with `pong`.
+const WS_HEARTBEAT_MS = 20_000
+
 function runWsTransport({ relayBase, originUrl, keepPath }) {
   const wsBase = relayBase.replace(/^http/, "ws")
-  const wsUrl = `${wsBase}/_connect`
+
+  // The `ws` package ignores HTTPS_PROXY; tunnel the relay socket through
+  // the proxy with a CONNECT agent when one is configured.
+  const wsOpts = {}
+  const proxyUrl = wsBase.startsWith("wss:") ? proxyUrlFor(relayBase) : null
+  if (proxyUrl) {
+    wsOpts.agent = new ConnectProxyAgent(proxyUrl)
+    if (process.env.ANONTUN_DEBUG) console.error(`[anontun] relay via proxy ${new URL(proxyUrl).host}`)
+  }
+
+  let token = null
+  let secret = null
+  let announced = false
+  let socket = null
+
+  const origin = createOriginBridge(originUrl, keepPath, (frame) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return
+    try { socket.send(JSON.stringify(frame)) } catch {}
+  })
+
+  onShutdown = () => new Promise((r) => {
+    const ws = socket
+    if (!ws || ws.readyState !== WebSocket.OPEN) { r(); return }
+    ws.once("close", r)
+    try { ws.close(1000, "bye") } catch { r() }
+  })
 
   return new Promise((resolve, reject) => {
-    // The `ws` package ignores HTTPS_PROXY; tunnel the relay socket through
-    // the proxy with a CONNECT agent when one is configured.
-    const wsOpts = {}
-    const proxyUrl = wsUrl.startsWith("wss:") ? proxyUrlFor(relayBase) : null
-    if (proxyUrl) {
-      wsOpts.agent = new ConnectProxyAgent(proxyUrl)
-      if (process.env.ANONTUN_DEBUG) console.error(`[anontun] relay via proxy ${new URL(proxyUrl).host}`)
-    }
-    const ws = new WebSocket(wsUrl, wsOpts)
-    let registered = false
-    onShutdown = () => new Promise((r) => { ws.once("close", r); try { ws.close(1000, "bye") } catch { r() } })
+    let attempt = 0
 
-    const origin = createOriginBridge(originUrl, keepPath, (frame) => {
-      if (ws.readyState !== WebSocket.OPEN) return
-      try { ws.send(JSON.stringify(frame)) } catch {}
-    })
+    const connect = () => {
+      // With a token + secret the relay re-attaches us to the same tunnel, so
+      // the public URL survives a dropped socket.
+      const url = token && secret
+        ? `${wsBase}/_connect?token=${encodeURIComponent(token)}&secret=${encodeURIComponent(secret)}`
+        : `${wsBase}/_connect`
+      const ws = new WebSocket(url, wsOpts)
+      socket = ws
+      let heartbeat = null
 
-    ws.on("message", (raw) => {
-      let msg
-      try { msg = JSON.parse(raw.toString()) } catch { return }
-      if (msg.type === "registered") {
-        origin.setToken(msg.token)
-        if (!registered) {
-          registered = true
-          printRegistered(msg.url, originUrl, "ws")
-          resolve()
+      const stopHeartbeat = () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null } }
+
+      ws.on("open", () => {
+        heartbeat = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) return
+          try { ws.ping() } catch {}
+          try { ws.send(JSON.stringify({ type: "ping", id: "hb" })) } catch {}
+        }, WS_HEARTBEAT_MS)
+        if (heartbeat.unref) heartbeat.unref()
+      })
+
+      ws.on("message", (raw) => {
+        let msg
+        try { msg = JSON.parse(raw.toString()) } catch { return }
+        if (msg.type === "registered") {
+          attempt = 0
+          // A relay that predates ws re-attach ignores ?token= and hands out a
+          // fresh tunnel, so the old link is dead. Say so instead of leaving
+          // the user with a URL that 503s.
+          const changed = announced && token && msg.token !== token
+          token = msg.token
+          secret = msg.secret ?? secret
+          origin.setToken(msg.token)
+          if (!announced) {
+            announced = true
+            printRegistered(msg.url, originUrl, "ws")
+            resolve()
+          } else if (changed) {
+            console.error("anontun: the relay issued a new tunnel instead of re-attaching; the previous URL is gone")
+            printRegistered(msg.url, originUrl, "ws")
+          }
+          return
         }
-        return
-      }
-      origin.handleFrame(msg)
-    })
+        origin.handleFrame(msg)
+      })
 
-    ws.on("close", (code, reason) => {
-      if (shuttingDown) return
-      if (!registered) {
-        reject(new Error(`ws closed before register code=${code} reason=${reason?.toString() ?? ""}`))
-        return
+      const retry = (why) => {
+        stopHeartbeat()
+        if (shuttingDown || socket !== ws) return
+        socket = null
+        if (!announced) { reject(new Error(why)); return }
+        if (attempt >= WS_RECONNECT_ATTEMPTS) {
+          console.error(`anontun: ${why}; giving up after ${attempt} attempts`)
+          process.exit(1)
+        }
+        attempt++
+        console.error(`anontun: ${why}; reconnecting (${attempt}/${WS_RECONNECT_ATTEMPTS})`)
+        setTimeout(connect, WS_RECONNECT_DELAY_MS * Math.min(attempt, 5))
       }
-      console.error(`anontun: ws closed code=${code} reason=${reason?.toString() ?? ""}`)
-      process.exit(1)
-    })
-    ws.on("error", (err) => {
-      if (shuttingDown) return
-      if (!registered) {
-        reject(new Error(`ws error: ${err.message}`))
-        return
-      }
-      console.error(`anontun: ws error: ${err.message}`)
-      process.exit(1)
-    })
+
+      ws.on("close", (code, reason) => {
+        // The relay refuses a re-attach it cannot match (gone, or taken over).
+        // Fall back to a fresh tunnel — the URL changes, which is better than
+        // exiting, and the CLI prints nothing new only because nothing else can
+        // be done about the old link.
+        if (code === 4403 || code === 4409) { token = null; secret = null }
+        retry(`relay socket closed (code=${code}${reason?.length ? ` ${reason.toString()}` : ""})`)
+      })
+      ws.on("error", (err) => retry(`relay socket error: ${err.message}`))
+    }
+
+    connect()
   })
 }
 

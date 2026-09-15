@@ -22,9 +22,9 @@ export interface Env {
 // Connector → relay
 export interface RegisterFrame { type: "register" }
 
-// Relay → connector (after register). `secret` is only present on the sse
-// transport: the connector sends it back on every /_respond call and on
-// reconnect, so a public client that knows the token cannot forge responses.
+// Relay → connector (after register). `secret` authenticates the connector on
+// re-attach (both transports) and on every /_respond call (sse), so a public
+// client that knows the token cannot take over the tunnel or forge responses.
 export interface RegisteredFrame { type: "registered"; token: string; url: string; secret?: string }
 
 // Relay → connector: a public client made an HTTP request

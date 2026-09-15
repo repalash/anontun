@@ -3,7 +3,8 @@
 // Routes:
 //   GET  /                           → tiny landing page with usage instructions
 //   GET  /_health                    → "ok"
-//   WS   /_connect                   → connector opens this; relay assigns a token
+//   WS   /_connect                   → connector opens this; relay assigns a token.
+//                                      ?token=&secret= re-attaches after a drop
 //   GET  /_connect/sse               → connector opens an SSE stream instead of a
 //                                      WebSocket; relay assigns a token + secret.
 //                                      ?token=&secret= re-attaches to a live tunnel
@@ -70,12 +71,26 @@ export default {
       if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return jsonError("bad_request", "expected websocket upgrade (use /_connect/sse for the sse transport)", 400)
       }
-      const token = generateToken()
+      // ?token=&secret= re-attaches to a live tunnel after the socket dropped,
+      // so the public URL survives; without them a fresh tunnel is created.
+      const qToken = url.searchParams.get("token")
+      const qSecret = url.searchParams.get("secret")
+      let token: string
+      let reconnect = false
+      if (qToken) {
+        const t = canonicalToken(qToken)
+        if (!t || !qSecret) return jsonError("bad_request", "reconnect needs a valid token and secret", 400)
+        token = t
+        reconnect = true
+      } else {
+        token = generateToken()
+      }
       const id = env.TUNNEL.idFromName(token)
       const fwd = new Request(req.url, req)
       fwd.headers.set("x-anontun-token", token)
       fwd.headers.set("x-anontun-base", base)
       fwd.headers.set("x-anontun-url", publicUrl(token))
+      if (reconnect) fwd.headers.set("x-anontun-reconnect", "1")
       return env.TUNNEL.get(id).fetch(fwd)
     }
 
